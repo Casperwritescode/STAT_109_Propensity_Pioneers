@@ -1,0 +1,162 @@
+```{r}
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+kaggle_total_data <- collect(kaggle_total_data)
+
+
+# Refactor device type variable to be categorical
+kaggle_total_data$device_type <- ifelse(
+  kaggle_total_data$device_mobile == 1, "mobile",
+  ifelse(
+    kaggle_total_data$device_computer == 1, "computer",
+    "tablet"
+  )
+)
+
+# Then make sure it's a factor - factor() is similar to as.factor()
+kaggle_total_data$device_type <- factor(
+  kaggle_total_data$device_type,
+  levels = c("mobile", "computer", "tablet")
+)
+
+# exlucde UserID
+new_kaggle_total_data <- kaggle_total_data[,-1]
+# str(new_kaggle_total_data)
+
+new_kaggle_total_data$device_type <- as.factor(new_kaggle_total_data$device_type)
+str(new_kaggle_total_data)
+
+set.seed(123)
+ind <- base::sample(1:2, nrow(kaggle_total_data), replace = TRUE, prob = c(0.5, 0.5))
+train_df_5050 <- kaggle_total_data[ind == 1, ]
+test_df_5050  <- kaggle_total_data[ind == 2, ]
+
+# Check the structure
+# str(train_df) 
+
+# class(kaggle_total_data)
+```
+
+
+```{r}
+%md
+Interaction terms
+```
+
+
+```{r}
+model_interaction_terms <- glm(ordered ~ basket_icon_click + basket_add_list + basket_add_detail + sort_by + image_picker + account_page_click + detail_wishlist_add + checked_delivery_detail + checked_returns_detail + sign_in + saw_checkout + saw_delivery + saw_account_upgrade + saw_homepage + returning_user + loc_uk + device_type + device_type:saw_checkout + returning_user:promo_banner_click + sort_by:image_picker + loc_uk:checked_delivery_detail, data = train_df_5050, family = "binomial")
+
+summary(model_interaction_terms)
+```
+
+
+```{r}
+best_model_interaction_term <- glm(ordered ~ basket_icon_click + basket_add_list + basket_add_detail + image_picker + account_page_click + detail_wishlist_add + checked_delivery_detail + checked_returns_detail + sign_in + saw_checkout + saw_delivery + saw_account_upgrade + saw_homepage + returning_user + loc_uk + device_type + returning_user:promo_banner_click + checked_delivery_detail:loc_uk, data = train_df_5050, family = "binomial")
+
+summary(best_model_interaction_term)
+```
+
+
+```{r}
+# test prediction
+test_prediction_probs_5050 <- predict(best_model_interaction_term, test_df_5050, type = "response")
+
+# Step 1: Create binary prediction from logistic probabilities
+test_prediction_results_5050 <- ifelse(test_prediction_probs_5050 > 0.5, 1, 0)
+
+```
+
+
+```{r}
+# Load caret if needed
+library(caret)
+
+# Step 4: Prepare data for confusion matrix
+test_prediction_results_5050 <- as.factor(test_prediction_results_5050)
+test_df_actual_5050 <- as.factor(test_df_5050$ordered)
+
+# Step 5: Evaluate with confusion matrix
+cm <- confusionMatrix(data = test_prediction_results_5050,
+                      reference = test_df_actual_5050,
+                      positive = "1")
+
+# Step 6: Output results
+print(cm)
+```
+
+
+```{r}
+library(MASS)
+
+# Stepwise AIC (both directions by default)
+model_step <- stepAIC(model_interaction_terms, direction = "both")
+
+# View the result
+summary(model_step)
+```
+
+
+```{r}
+final_model <- glm(ordered ~ basket_icon_click + basket_add_list + basket_add_detail + sort_by + image_picker + account_page_click + detail_wishlist_add + checked_delivery_detail + checked_returns_detail + sign_in + saw_checkout + saw_delivery + saw_account_upgrade + saw_homepage + returning_user + loc_uk + device_type, data = new_train_df_5050, family = "binomial"
+)
+
+summary(final_model)
+```
+
+
+```{r}
+library(MASS)
+
+# Stepwise AIC (both directions by default)
+model_step <- stepAIC(final_model, direction = "both")
+
+# View the result
+summary(model_step)
+```
+
+
+```{r}
+library(MASS)
+
+# Stepwise AIC (both directions by default)
+model_step <- stepAIC(model_2, direction = "both")
+
+# View the result
+summary(model_step)
+```
+
+
+```{r}
+library(MASS)
+
+# Stepwise AIC (both directions by default)
+model_step <- stepAIC(model, direction = "both")
+
+# View the result
+summary(model_step)
+```
+
+
+```{r}
+model <- glm(
+  ordered ~ . -UserID,
+  data = train_df,
+  family = "binomial"
+)
+
+summary(model)
+```
