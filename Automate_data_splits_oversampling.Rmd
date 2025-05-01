@@ -1,0 +1,226 @@
+
+---
+title: "Automate_data_splits_oversampling"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+%md
+Data ingestion
+```
+
+
+```{r}
+%md
+Original Device variables - all three - consider removing one
+```
+
+
+```{r}
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+original_kaggle_total_data <- collect(kaggle_total_data)
+
+# Remove UserID
+original_kaggle_total_data <- original_kaggle_total_data[,-1]
+
+# Make sure ordered is a factor
+original_kaggle_total_data$ordered <- as.factor(original_kaggle_total_data$ordered)
+
+# Check the structure
+str(original_kaggle_total_data) 
+```
+
+
+```{r}
+%md
+Data Ingestion
+```
+
+
+```{r}
+%md
+Transformed Device variable
+```
+
+
+```{r}
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+kaggle_total_data <- collect(kaggle_total_data)
+
+# Refactor device type variable to be categorical
+kaggle_total_data$device_type <- ifelse(
+  kaggle_total_data$device_mobile == 1, "mobile",
+  ifelse(
+    kaggle_total_data$device_computer == 1, "computer",
+    "tablet"
+  )
+)
+
+# Then make sure it's a factor - factor() is similar to as.factor()
+kaggle_total_data$device_type <- factor(
+  kaggle_total_data$device_type,
+  levels = c("mobile", "computer", "tablet")
+)
+
+kaggle
+
+# exlucde UserID
+new_kaggle_total_data <- kaggle_total_data[,-c(1, 20, 21, 22)]
+# str(kaggle_total_data)
+str(new_kaggle_total_data)
+```
+
+
+```{r}
+%md
+Original one hot encoded devices
+```
+
+
+```{r}
+library(caret)
+library(dplyr)
+
+prepare_named_splits <- function(original_kaggle_total_data, 
+                                 target = "ordered",
+#                                 train_size = 60000,
+#                                 test_size = 60000,
+                                 seed = 1234) {
+  set.seed(seed)
+  original_kaggle_total_data[[target]] <- as.factor(original_kaggle_total_data[[target]])
+
+  # Define train-test splits
+  split_defs <- list(
+    "50" = 0.5,
+    "60" = 0.6,
+    "70" = 0.7,
+    "80" = 0.8
+  )
+
+  results <- list()
+
+  for (split_name in names(split_defs)) {
+    train_frac <- split_defs[[split_name]]
+    test_frac <- 1 - train_frac
+    test_name <- as.character(round(test_frac * 100))
+
+    # Stratified split
+    train_index <- createDataPartition(original_kaggle_total_data[[target]], p = train_frac, list = FALSE)
+    train_df <- original_kaggle_total_data[train_index, ]
+    test_df <- original_kaggle_total_data[-train_index, ]
+
+    # Limit to N rows
+    # train_df <- head(train_df, train_size)
+    # test_df <- head(test_df, test_size)
+
+    # caret trainControl for oversampling
+    ctrl <- trainControl(
+      method = "none",
+      sampling = "up"
+    )
+
+    # Store results
+    train_label <- paste0("train_", split_name)
+    test_label <- paste0("test_", test_name)
+    ctrl_label <- paste0("ctrl_", split_name)
+
+    results[[train_label]] <- train_df
+    results[[test_label]] <- test_df
+    results[[ctrl_label]] <- ctrl
+
+    # Print what was added
+    message("Created: ", train_label, ", ", test_label, ", ", ctrl_label)
+  }
+
+  return(results)
+}
+
+# Assuming you have the original data frame 'df' loaded
+# First, create the splits and store them as individual variables
+
+# Set seed and define splits
+set.seed(1234)
+
+# Perform the split operation and persist each as an individual object
+splits <- prepare_named_splits(original_kaggle_total_data)
+
+# Extract specific splits
+train_50 <- splits$train_50
+test_50 <- splits$test_50
+ctrl_50  <- splits$ctrl_50
+
+train_60 <- splits$train_60
+test_40 <- splits$test_40
+ctrl_60  <- splits$ctrl_60
+
+train_70 <- splits$train_70
+test_30 <- splits$test_30
+ctrl_70  <- splits$ctrl_70
+
+train_80 <- splits$train_80
+test_20 <- splits$test_20
+ctrl_80  <- splits$ctrl_80
+```
+
+
+```{r}
+str(train_70)
+```
+
+
+```{r}
+%md
+Example with oversampling
+```
+
+
+```{r}
+
+# Train a GLM model on the 70-30 split
+model_glm <- train(
+  ordered ~ ., 
+  data = train_70,                # Training data (oversampling happens inside)
+  method = "glm", 
+  family = "binomial",            # GLM for binary classification
+  trControl = ctrl_70             # TrainControl with oversampling
+)
+
+# Predict with the trained GLM model
+preds <- predict(model_glm, newdata = test_30)
+
+# Evaluate performance
+confusionMatrix(preds, test_30$ordered)
+
+```
