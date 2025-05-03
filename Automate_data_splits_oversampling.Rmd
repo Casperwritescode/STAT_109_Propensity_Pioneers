@@ -1,6 +1,5 @@
-
 ---
-title: "Automate_data_splits_oversampling_v.2"
+title: "Untitled Notebook 2025-05-03 13:47:27"
 output:
   html_document:
     toc: true
@@ -9,13 +8,7 @@ output:
 
 ```{r}
 %md
-Data ingestion
-```
-
-
-```{r}
-%md
-Original Device variables
+Define original dataset
 ```
 
 
@@ -48,26 +41,9 @@ original_kaggle_total_data$ordered <- as.factor(original_kaggle_total_data$order
 str(original_kaggle_total_data) 
 ```
 
-
-```{r}
-library(dplyr)
-original_kaggle_total_data %>% filter(device_mobile == 1) %>% count()
-```
-
-
-```{r}
-original_kaggle_total_data %>% filter(device_computer == 1) %>% count()
-```
-
-
-```{r}
-original_kaggle_total_data %>% filter(device_tablet == 1) %>% count()
-```
-
-
 ```{r}
 %md
-Transformed Device variable
+Define categorical Device variable data
 ```
 
 
@@ -114,34 +90,23 @@ str(new_kaggle_total_data)
 
 ```{r}
 %md
-Dropped device variable
+Define dropped Device variable dataset
 ```
 
 
 ```{r}
-dropped_device_kaggle_total_data <- kaggle_total_data[,c(-1, -19)]
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+dropped_device_kaggle_total_data <- original_kaggle_total_data[,-19]
 str(dropped_device_kaggle_total_data)
 ```
 
 
 ```{r}
 %md
-Define data
-```
-
-
-```{r}
-prepare_splits_original_kaggle_total_data <- function(seed = 1234, target = "ordered") {
-  prepare_named_splits(original_kaggle_total_data, target = target, seed = seed)
-}
-
-prepare_splits_new_kaggle_total_data <- function(seed = 1234, target = "ordered") {
-  prepare_named_splits(new_kaggle_total_data, target = target, seed = seed)
-}
-
-prepare_splits_dropped_device_kaggle_data <- function(seed = 1234, target = "ordered") {
-  prepare_named_splits(dropped_device_kaggle, target = target, seed = seed)
-}
+Train-test split + oversampling config
 ```
 
 
@@ -154,7 +119,7 @@ prepare_named_splits <- function(data,
                                  target = "ordered", 
                                  seed = 1234) {
   set.seed(seed)
-  data[[target]] <- as.factor(data[[target]])
+  data[[target]] <- as.factor(as.vector(data[[target]]))
 
   split_defs <- list("50" = 0.5, "60" = 0.6, "70" = 0.7, "80" = 0.8)
 
@@ -167,7 +132,13 @@ prepare_named_splits <- function(data,
     train_df <- data[train_index, ]
     test_df  <- data[-train_index, ]
 
-    ctrl <- trainControl(method = "none", sampling = "up")
+    ctrl <- ctrl <- trainControl(
+                    method = "repeatedcv",
+                    number = 5,
+                    repeats = 2,
+                    allowParallel = TRUE,
+                    sampling = "up"
+                    )
 
     # Construct persistent names with prefix
     train_var <- paste0(data_prefix, "_train_", split_name)
@@ -187,38 +158,10 @@ prepare_named_splits <- function(data,
 
 ```{r}
 # For original_kaggle_total_data
-prepare_named_splits(original_kaggle_total_data, data_prefix = "original_kaggle_total_data")
+prepare_named_splits(original_kaggle_total_data, data_prefix = "original_kaggle_total_data", target = "ordered")
 
 # For new_kaggle_total_data
-prepare_named_splits(new_kaggle_total_data, data_prefix = "new_kaggle_total_data")
+prepare_named_splits(new_kaggle_total_data, data_prefix = "new_kaggle_total_data", target = "ordered")
 
 # For dropped_device_kaggle_total_data
-prepare_named_splits(dropped_device_kaggle_total_data, data_prefix = "dropped_device_kaggle_total_data")
-
-```
-
-
-```{r}
-%md
-Example with oversampling
-```
-
-
-```{r}
-
-# Train a GLM model on the 70-30 split
-model_glm <- train(
-  ordered ~ ., 
-  data = original_kaggle_total_data_train_50,                # Training data (oversampling happens inside)
-  method = "glm", 
-  family = "binomial",            # GLM for binary classification
-  trControl = original_kaggle_total_data_ctrl_50             # TrainControl with oversampling
-)
-
-# Predict with the trained GLM model
-preds <- predict(model_glm, newdata = original_kaggle_total_data_test_50)
-
-# Evaluate performance
-confusionMatrix(preds, original_kaggle_total_data_test_50$ordered)
-
-```
+prepare_named_splits(dropped_device_kaggle_total_data, data_prefix = "dropped_device_kaggle_total_data", target = "ordered")
