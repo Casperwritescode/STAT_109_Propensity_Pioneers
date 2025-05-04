@@ -1,0 +1,969 @@
+
+---
+title: "Bagged_model_v.2"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+%md
+Define original dataset
+```
+
+
+```{r}
+# Load dependencies
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+original_kaggle_total_data <- collect(kaggle_total_data)
+
+# Remove UserID
+original_kaggle_total_data <- original_kaggle_total_data[,-1]
+
+# Make sure ordered is a factor
+original_kaggle_total_data$ordered <- as.factor(original_kaggle_total_data$ordered)
+
+# Check the structure
+str(original_kaggle_total_data) 
+```
+
+
+```{r}
+str(kaggle_total_data)
+```
+
+
+```{r}
+%md
+Define categorical Device variable data
+```
+
+
+```{r}
+# Load dependencies
+library(SparkR)
+sparkR.session()
+
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+kaggle_total_data <- collect(kaggle_total_data)
+
+# Refactor device type variable to be categorical
+kaggle_total_data$device_type <- ifelse(
+  kaggle_total_data$device_mobile == 1, "mobile",
+  ifelse(
+    kaggle_total_data$device_computer == 1, "computer",
+    "tablet"
+  )
+)
+
+# Then make sure it's a factor - factor() is similar to as.factor()
+kaggle_total_data$device_type <- factor(
+  kaggle_total_data$device_type,
+  levels = c("mobile", "computer", "tablet")
+)
+
+# exlucde UserID
+new_kaggle_total_data <- kaggle_total_data[,-c(1, 20, 21, 22)]
+# confirm data structure
+str(new_kaggle_total_data)
+```
+
+
+```{r}
+%md
+Define dropped Device variable dataset
+```
+
+
+```{r}
+# Load dependencies
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+
+dropped_device_kaggle_total_data <- original_kaggle_total_data[,-19]
+str(dropped_device_kaggle_total_data)
+```
+
+
+```{r}
+%md
+Train-test split + oversampling config
+```
+
+
+```{r}
+# Load dependencies
+library(caret)
+library(dplyr)
+
+# Define train-test splits and target variable to manage oversampling
+prepare_named_splits <- function(data, 
+                                 data_prefix,      
+                                 target = "ordered", 
+                                 sample_size = NULL,  
+                                 seed = 1234) {
+  set.seed(seed)
+  
+  # Factorize target variable
+  data[[target]] <- factor(as.vector(data[[target]]), levels = c("0", "1"), labels = c("class0", "class1"))
+
+
+  # Define stratified sampling
+  if (!is.null(sample_size)) {
+    sample_index <- createDataPartition(data[[target]], p = sample_size / nrow(data), list = FALSE)
+    data <- data[sample_index, ]
+    message("Sampled down to ", nrow(data), " rows.")
+  }
+
+  # Define split names/sizes
+  split_defs <- list("50" = 0.5, "60" = 0.6, "70" = 0.7, "80" = 0.8)
+
+  # Iterate over splits
+  for (split_name in names(split_defs)) {
+    train_frac <- split_defs[[split_name]]
+    test_frac <- 1 - train_frac
+    test_name <- as.character(round(test_frac * 100))
+
+    # Partition train/test data
+    train_index <- createDataPartition(data[[target]], p = train_frac, list = FALSE)
+    train_df <- data[train_index, ]
+    test_df  <- data[-train_index, ]
+
+    # Define train control cross validation, repeats and sampling technique
+    ctrl <- trainControl(
+      method = "repeatedcv",
+      number = 4,
+      repeats = 2,
+      allowParallel = TRUE,
+      sampling = "up",
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+
+    # Construct persistent names
+    train_var <- paste0(data_prefix, "_train_", split_name)
+    test_var  <- paste0(data_prefix, "_test_", test_name)
+    ctrl_var  <- paste0(data_prefix, "_ctrl_", split_name)
+
+    assign(train_var, train_df, envir = .GlobalEnv)
+    assign(test_var, test_df, envir = .GlobalEnv)
+    assign(ctrl_var, ctrl, envir = .GlobalEnv)
+
+    # Manage named output
+    message("Created: ", train_var, ", ", test_var, ", ", ctrl_var)
+  }
+}
+
+```
+
+
+```{r}
+# Apply function to different dataset types
+
+prepare_named_splits(original_kaggle_total_data, "original_kaggle_total_data", sample_size = 60000)
+
+prepare_named_splits(new_kaggle_total_data, "new_kaggle_total_data", sample_size = 60000)
+
+prepare_named_splits(dropped_device_kaggle_total_data, "dropped_device_kaggle_total_data", sample_size = 60000)
+
+```
+
+
+```{r}
+%md
+50-50 Bagged tree model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_orig_5050 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_50,
+             method="treebag",
+             trControl=original_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+
+vi <- varImp(bag_orig_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_orig_5050")
+```
+
+
+```{r}
+bag_orig_5050
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_orig_5050, newdata = original_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_orig_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_orig_5050, newdata = original_kaggle_total_data_test_50)
+confusionMatrix(preds_class, original_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+50-50 Bagged tree model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_cat_5050 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_50,
+             method="treebag",
+             trControl=new_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+
+vi <- varImp(bag_cat_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_cat_5050")
+```
+
+
+```{r}
+bag_cat_5050
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_cat_5050, newdata = new_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_cat_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_cat_5050, newdata = new_kaggle_total_data_test_50)
+confusionMatrix(preds_class, new_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+50-50 Bagged tree model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_drop_5050 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_50,
+             method="treebag",
+             trControl=dropped_device_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+
+vi <- varImp(bag_drop_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_drop_5050")
+```
+
+
+```{r}
+bag_drop_5050
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_drop_5050, newdata = dropped_device_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_drop_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_drop_5050, newdata = dropped_device_kaggle_total_data_test_50)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Bagged tree model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_orig_6040 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_60,
+             method="treebag",
+             trControl=original_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+
+vi <- varImp(bag_orig_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_orig_6040")
+```
+
+
+```{r}
+bag_orig_6040
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_orig_6040, newdata = original_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_orig_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_orig_6040, newdata = original_kaggle_total_data_test_40)
+confusionMatrix(preds_class, original_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Bagged tree model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_cat_6040 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_60,
+             method="treebag",
+             trControl=new_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+
+vi <- varImp(bag_cat_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_cat_6040")
+```
+
+
+```{r}
+bag_cat_6040
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_cat_6040, newdata = new_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_cat_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_cat_6040, newdata = new_kaggle_total_data_test_40)
+confusionMatrix(preds_class, new_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Bagged tree model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_drop_6040 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_60,
+             method="treebag",
+             trControl=dropped_device_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+
+vi <- varImp(bag_drop_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_drop_6040")
+```
+
+
+```{r}
+bag_drop_6040
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_drop_6040, newdata = dropped_device_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_drop_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_drop_6040, newdata = dropped_device_kaggle_total_data_test_40)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Bagged tree model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_orig_7030 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_70,
+             method="treebag",
+             trControl=original_kaggle_total_data_ctrl_70,
+             importance=TRUE)
+
+vi <- varImp(bag_orig_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_orig_7030")
+```
+
+
+```{r}
+bag_orig_7030
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_orig_7030, newdata = original_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_orig_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_orig_7030, newdata = original_kaggle_total_data_test_30)
+confusionMatrix(preds_class, original_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Bagged tree model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_cat_7030 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_70,
+             method="treebag",
+             trControl=new_kaggle_total_data_ctrl_70,
+             importance=TRUE)
+
+vi <- varImp(bag_cat_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_cat_7030")
+```
+
+
+```{r}
+bag_cat_7030
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_cat_7030, newdata = new_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_cat_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_cat_7030, newdata = new_kaggle_total_data_test_30)
+confusionMatrix(preds_class, new_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Bagged tree model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_drop_7030 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_70,
+             method="treebag",
+             trControl=dropped_device_kaggle_total_data_ctrl_70,
+             importance=TRUE)
+
+vi <- varImp(bag_drop_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_drop_7030")
+```
+
+
+```{r}
+bag_drop_7030
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_drop_7030, newdata = dropped_device_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_drop_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_drop_7030, newdata = dropped_device_kaggle_total_data_test_30)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Bagged tree model - origial dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_orig_8020 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_80,
+             method="treebag",
+             trControl=original_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+
+vi <- varImp(bag_orig_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_orig_8020")
+```
+
+
+```{r}
+bag_orig_8020
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_orig_8020, newdata = original_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_orig_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_orig_8020, newdata = original_kaggle_total_data_test_20)
+confusionMatrix(preds_class, original_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Bagged tree model - cateogrical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_cat_8020 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_80,
+             method="treebag",
+             trControl=new_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+
+vi <- varImp(bag_cat_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_cat_8020")
+```
+
+
+```{r}
+bag_cat_8020
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_cat_8020, newdata = new_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_cat_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_cat_8020, newdata = new_kaggle_total_data_test_20)
+confusionMatrix(preds_class, new_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Bagged tree model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+bag_drop_8020 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_80,
+             method="treebag",
+             trControl=dropped_device_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+
+vi <- varImp(bag_drop_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - bag_drop_8020")
+```
+
+
+```{r}
+bag_drop_8020
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(bag_drop_8020, newdata = dropped_device_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - bag_drop_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(bag_drop_8020, newdata = dropped_device_kaggle_total_data_test_20)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+Evaluation
+```
+
+
+```{r}
+# Define model list
+bagged_tree_model_mapping <- list(
+  original_kaggle_total_data = c("bag_orig_8020", "bag_orig_7030", "bag_orig_6040", "bag_orig_5050"),
+  new_kaggle_total_data = c("bag_cat_8020", "bag_cat_7030", "bag_cat_6040", "bag_cat_5050"),
+  dropped_device_kaggle_total_data = c("bag_drop_8020", "bag_drop_7030", "bag_drop_6040", "bag_drop_5050")
+)
+```
+
+
+```{r}
+# Load dependencies
+library(caret)
+library(pROC)
+library(rpart)
+install.packages("rpart.plot")
+library(rpart.plot)
+
+evaluate_pretrained_models <- function(model_mapping, target = "ordered") {
+  for (dataset_prefix in names(model_mapping)) {
+    model_names <- model_mapping[[dataset_prefix]]
+
+    for (model_name in model_names) {
+      model <- get(model_name)
+
+      # Extract split percentage from model name
+      split_match <- regmatches(model_name, regexpr("[0-9]{4}", model_name))
+      train_percent <- as.numeric(substr(split_match, 1, 2))
+      test_percent <- 100 - train_percent
+
+      test_name <- paste0(dataset_prefix, "_test_", test_percent)
+      test_df <- get(test_name)
+
+      message("\n--- Evaluating model ", model_name, " on ", test_name, " ---")
+
+      # Predictions
+      preds_class <- predict(model, newdata = test_df)
+      preds_prob <- predict(model, newdata = test_df, type = "prob")[, 2]
+
+      # Confusion Matrix
+      cm <- confusionMatrix(preds_class, test_df[[target]])
+      print(cm)
+
+      # AUC and ROC
+      roc_obj <- roc(response = test_df[[target]], predictor = preds_prob)
+      auc_val <- auc(roc_obj)
+      print(paste("AUC:", round(auc_val, 4)))
+      plot(roc_obj, main = paste("ROC -", model_name))
+
+      # Variable Importance
+      if ("varImp" %in% methods(class = class(model$finalModel))) {
+        vi <- varImp(model)
+        plot(vi, top = 10, main = paste("Top 10 Variable Importance -", model_name))
+      } else {
+        message("Variable importance not supported for model: ", model_name)
+      }
+
+      # Tree visualization for bagged trees
+      if ("bag" %in% model$method) {
+        message("Visualizing tree from bagged model ", model_name)
+        tree1 <- getTree(model$finalModel, k = 1, labelVar = TRUE)
+        print(head(tree1))  # print the first tree structure for brevity
+
+        # Visualizing the tree
+        rpart_tree <- rpart(ordered ~ ., data = test_df)
+        rpart.plot(rpart_tree, main = paste("Tree from Bagged Model: ", model_name))
+      }
+    }
+  }
+}
+
+```
+
+
+```{r}
+# Run evaluation with model list
+evaluate_pretrained_models(bagged_tree_model_mapping)
+```
+
+
+```{r}
+%md
+
+```
+
+
+```{r}
+%md
+
+```

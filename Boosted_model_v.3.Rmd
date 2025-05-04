@@ -1,0 +1,1018 @@
+
+---
+title: "Boosted_model_v.3"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+# Load dependencies
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+original_kaggle_total_data <- collect(kaggle_total_data)
+
+# Remove UserID
+original_kaggle_total_data <- original_kaggle_total_data[,-1]
+
+# Make sure ordered is a factor
+original_kaggle_total_data$ordered <- as.factor(original_kaggle_total_data$ordered)
+
+# Check the structure
+str(original_kaggle_total_data) 
+```
+
+
+```{r}
+# Load dependencies
+install.packages("SparkR")
+library(SparkR)
+sparkR.session()
+
+# Define the file path
+training_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_training_sample.csv"
+testing_file_path <- "dbfs:/FileStore/tables/ecom_user_data/customer_propensity_testing_sample.csv"
+
+# Read the CSV file into a Spark DataFrame
+kaggle_training_data_df <- read.df(training_file_path, source = "csv", header = "true", inferSchema = "true")
+kaggle_testing_data_df <- read.df(testing_file_path, source = "csv", header = "true", inferSchema = "true")
+
+# Combine datasets
+kaggle_total_data <- rbind(kaggle_training_data_df, kaggle_testing_data_df)
+
+# Bring the data from Spark into R memory - only required for SparkR
+kaggle_total_data <- collect(kaggle_total_data)
+
+# Refactor device type variable to be categorical
+kaggle_total_data$device_type <- ifelse(
+  kaggle_total_data$device_mobile == 1, "mobile",
+  ifelse(
+    kaggle_total_data$device_computer == 1, "computer",
+    "tablet"
+  )
+)
+
+# Then make sure it's a factor - factor() is similar to as.factor()
+kaggle_total_data$device_type <- factor(
+  kaggle_total_data$device_type,
+  levels = c("mobile", "computer", "tablet")
+)
+
+# exlucde UserID
+new_kaggle_total_data <- kaggle_total_data[,-c(1, 20, 21, 22)]
+# confirm data structure
+str(new_kaggle_total_data)
+```
+
+
+```{r}
+dropped_device_kaggle_total_data <- kaggle_total_data[,-19]
+str(dropped_device_kaggle_total_data)
+```
+
+
+```{r}
+# Load dependencies
+library(caret)
+library(dplyr)
+
+prepare_named_splits <- function(data, 
+                                 data_prefix,      
+                                 target = "ordered", 
+                                 sample_size = NULL,  
+                                 seed = 1234) {
+  set.seed(seed)
+  data[[target]] <- factor(as.vector(data[[target]]), levels = c("0", "1"), labels = c("class0", "class1"))
+
+
+  # Optional stratified sampling
+  if (!is.null(sample_size)) {
+    sample_index <- createDataPartition(data[[target]], p = sample_size / nrow(data), list = FALSE)
+    data <- data[sample_index, ]
+    message("Sampled down to ", nrow(data), " rows.")
+  }
+
+  split_defs <- list("50" = 0.5, "60" = 0.6, "70" = 0.7, "80" = 0.8)
+
+  for (split_name in names(split_defs)) {
+    train_frac <- split_defs[[split_name]]
+    test_frac <- 1 - train_frac
+    test_name <- as.character(round(test_frac * 100))
+
+    train_index <- createDataPartition(data[[target]], p = train_frac, list = FALSE)
+    train_df <- data[train_index, ]
+    test_df  <- data[-train_index, ]
+
+    ctrl <- trainControl(
+      method = "repeatedcv",
+      number = 5,
+      repeats = 2,
+      allowParallel = TRUE,
+      sampling = "up",
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+
+    # Construct persistent names
+    train_var <- paste0(data_prefix, "_train_", split_name)
+    test_var  <- paste0(data_prefix, "_test_", test_name)
+    ctrl_var  <- paste0(data_prefix, "_ctrl_", split_name)
+
+    assign(train_var, train_df, envir = .GlobalEnv)
+    assign(test_var, test_df, envir = .GlobalEnv)
+    assign(ctrl_var, ctrl, envir = .GlobalEnv)
+
+    message("Created: ", train_var, ", ", test_var, ", ", ctrl_var)
+  }
+}
+
+```
+
+
+```{r}
+# For original_kaggle_total_data
+prepare_named_splits(original_kaggle_total_data, data_prefix = "original_kaggle_total_data", target = "ordered", sample_size = 30000)
+
+# For new_kaggle_total_data
+prepare_named_splits(new_kaggle_total_data, data_prefix = "new_kaggle_total_data", target = "ordered", sample_size = 30000)
+
+# For dropped_device_kaggle_total_data
+prepare_named_splits(dropped_device_kaggle_total_data, data_prefix = "dropped_device_kaggle_total_data", target = "ordered", sample_size = 30000)
+```
+
+
+```{r}
+%md
+50-50 Boosted model - original dataset
+```
+
+
+```{r}
+# Load dependencies
+install.packages("mlbench")
+library(mlbench)
+library(caret)
+install.packages("xgboost")
+library(xgboost)
+library(pROC)
+
+set.seed(1234)
+boost_orig_5050 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_50,
+             method="xgbTree",
+             trControl=original_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+# Look at model summary
+print(boost_orig_5050)
+# Variable importance
+vi <- varImp(boost_orig_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_orig_5050")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_orig_5050, newdata = original_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_orig_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_orig_5050, newdata = original_kaggle_total_data_test_50)
+confusionMatrix(preds_class, original_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+50-50 Boosted model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_cat_5050 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_50,
+             method="xgbTree",
+             trControl=new_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+# Look at model summary
+print(boost_cat_5050)
+# Variable importance
+vi <- varImp(boost_cat_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_cat_5050")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_cat_5050, newdata = new_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_cat_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_cat_5050, newdata = new_kaggle_total_data_test_50)
+confusionMatrix(preds_class, new_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+50-50 Boosted model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_drop_5050 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_50,
+             method="xgbTree",
+             trControl=dropped_device_kaggle_total_data_ctrl_50,
+             importance=TRUE)
+# Look at model summary
+print(boost_drop_5050)
+# Variable importance
+vi <- varImp(boost_drop_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_drop_5050")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_drop_5050, newdata = dropped_device_kaggle_total_data_test_50, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_50$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_drop_5050",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_drop_5050, newdata = dropped_device_kaggle_total_data_test_50)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Boosted model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_orig_6040 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_60,
+             method="xgbTree",
+             trControl=original_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+# Look at model summary
+print(boost_orig_6040)
+# Variable importance
+vi <- varImp(boost_orig_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_orig_6040")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_orig_6040, newdata = original_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_orig_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_orig_6040, newdata = original_kaggle_total_data_test_40)
+confusionMatrix(preds_class, original_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Boosted model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_cat_6040 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_60,
+             method="xgbTree",
+             trControl=orig_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+# Look at model summary
+print(boost_cat_6040)
+# Variable importance
+vi <- varImp(boost_cat_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_cat_6040")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_cat_6040, newdata = new_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_cat_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_cat_6040, newdata = new_kaggle_total_data_test_40)
+confusionMatrix(preds_class, new_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+60-40 Boosted model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_drop_6040 <- train(ordered ~ ., 
+             data=dropped_device_kaggle_total_data_train_60,
+             method="xgbTree",
+             trControl=dropped_device_kaggle_total_data_ctrl_60,
+             importance=TRUE)
+# Look at model summary
+print(boost_drop_6040)
+# Variable importance
+vi <- varImp(boost_drop_6040)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_drop_6040")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_cat_6040, newdata = new_kaggle_total_data_test_40, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_40$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_cat_6040",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_cat_6040, newdata = new_kaggle_total_data_test_40)
+confusionMatrix(preds_class, new_kaggle_total_data_test_40$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Boosted model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_orig_7030 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_70,
+             method="xgbTree",
+             trControl=original_kaggle_total_data_ctrl_70,
+             importance=TRUE)
+# Look at model summary
+print(boost_orig_7030)
+# Variable importance
+vi <- varImp(boost_orig_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_orig_7030")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_orig_7030, newdata = original_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_orig_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_orig_7030, newdata = original_kaggle_total_data_test_30)
+confusionMatrix(preds_class, original_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Boosted model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_cat_7030 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_70,
+             method="xgbTree",
+             trControl=new_kaggle_total_data_ctrl_70,
+             importance=TRUE)
+# Look at model summary
+print(boost_cat_7030)
+# Variable importance
+vi <- varImp(boost_cat_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_cat_7030")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_cat_7030, newdata = new_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_cat_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_cat_7030, newdata = new_kaggle_total_data_test_30)
+confusionMatrix(preds_class, new_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+70-30 Boosted model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_drop_7030 <- train(ordered ~ ., 
+             data=dropped_kaggle_total_data_train_80,
+             method="xgbTree",
+             trControl=dropped_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+# Look at model summary
+print(boost_drop_7030)
+# Variable importance
+vi <- varImp(boost_drop_7030)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_drop_7030")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_drop_7030, newdata = dropped_device_kaggle_total_data_test_30, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_30$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_drop_7030",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_drop_7030, newdata = dropped_device_kaggle_total_data_test_30)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_30$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Boosted model - original dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_orig_8020 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_80,
+             method="xgbTree",
+             trControl=original_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+# Look at model summary
+print(boost_orig_8020)
+# Variable importance
+vi <- varImp(boost_orig_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_orig_8020")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_orig_8020, newdata = original_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = original_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_orig_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_orig_8020, newdata = original_kaggle_total_data_test_20)
+confusionMatrix(preds_class, original_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Boosted model - categorical Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_cat_8020 <- train(ordered ~ ., 
+             data=new_kaggle_total_data_train_80,
+             method="xgbTree",
+             trControl=new_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+# Look at model summary
+print(boost_cat_8020)
+# Variable importance
+vi <- varImp(boost_cat_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_cat_8020")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_cat_8020, newdata = new_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = new_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_cat_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_cat_8020, newdata = new_kaggle_total_data_test_20)
+confusionMatrix(preds_class, new_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+80-20 Boosted model - dropped Device dataset
+```
+
+
+```{r}
+set.seed(1234)
+boost_drop_8020 <- train(ordered ~ ., 
+             data=dropped_kaggle_total_data_train_80,
+             method="xgbTree",
+             trControl=dropped_kaggle_total_data_ctrl_80,
+             importance=TRUE)
+# Look at model summary
+print(boost_drop_8020)
+# Variable importance
+vi <- varImp(boost_drop_8020)
+plot(vi, top = 10, main = "Top 10 Variable Importance - boost_drop_8020")
+
+```
+
+
+```{r}
+# Generate prediction and ROC/AUC
+preds_prob <- predict(boost_drop_8020, newdata = dropped_device_kaggle_total_data_test_20, type = "prob")[, 2]
+
+roc_obj <- roc(response = dropped_device_kaggle_total_data_test_20$ordered, predictor = preds_prob)
+auc(roc_obj)
+
+# Plot roc
+plot.roc(roc_obj,
+         col = "#2c7bb6",
+         lwd = 2,
+         levels = c("class0", "class1"),
+         main = "ROC Curve - boost_drop_8020",
+         print.auc = TRUE,
+         auc.polygon = TRUE,
+         auc.polygon.col = "#a6cee3",
+         grid = TRUE,
+         print.thres = "best",
+         print.thres.pattern = "%.2f",
+         print.thres.cex = 0.8,
+         print.thres.col = "red")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(boost_drop_8020, newdata = dropped_device_kaggle_total_data_test_20)
+confusionMatrix(preds_class, dropped_device_kaggle_total_data_test_20$ordered, positive="class1")
+```
+
+
+```{r}
+%md
+Fine tuning
+```
+
+
+```{r}
+install.packages("mlbench")
+library(mlbench)
+library(caret)
+install.packages("xgboost")
+library(xgboost)
+library(pROC)
+
+CV <- trainControl(method="adaptive_cv",
+                  number = 3,
+                  repeats = 2,
+                  adaptive = list(min = 2,
+                                  alpha = 0.05,
+                                  method = 'gls',
+                                  complete = T),
+                allowParallel = T,
+                verboseIter = T,
+                returnData = F,
+                search = "random",
+                sampling = "up")
+
+g <- expand.grid(nrounds = seq(from = 400, to = 600, by = 5),
+                max_depth = 2,
+                eta = seq(from = 0.0200, to = 0.0205, by = 0.0001),
+                gamma = 6.68,
+                colsample_bytree = 0.476,
+                min_child_weight = 1,
+                subsample = 0.328)
+```
+
+
+```{r}
+%md
+Fine tuned model
+```
+
+
+```{r}
+# Load dependencies
+install.packages("mlbench")
+library(mlbench)
+library(caret)
+install.packages("xgboost")
+library(xgboost)
+library(pROC)
+
+# Boosting
+set.seed(1234)
+ft_boost_orig_5050 <- train(ordered ~ ., 
+             data=original_kaggle_total_data_train_50,
+             method="xgbTree",
+             trControl=CV,
+             tuneGrid = g)
+# Look at model summary
+print(ft_boost_orig_5050)
+# Variable importance
+vi <- varImp(ft_boost_orig_5050)
+plot(vi, top = 10, main = "Top 10 Variable Importance - ft_boost_orig_5050")
+```
+
+
+```{r}
+library(caret)
+
+preds_class <- predict(ft_boost_orig_5050, newdata = original_kaggle_total_data_test_50)
+confusionMatrix(preds_class, original_kaggle_total_data_test_50$ordered, positive="class1")
+```
+
+
+```{r}
+# Generate predictions
+boost_predict_test_df_5050 <-  predict(ft_boost_orig_5050, original_kaggle_total_data_test_50)
+
+# Predictions on the test set
+boost_pred_class_5050 <- predict(ft_boost_orig_5050, original_kaggle_total_data_test_50, type = "class")
+boost_pred_prob_5050 <- predict(ft_boost_orig_5050, original_kaggle_total_data_test_50, type = "prob")[, '1']  # Probabilities for class '1'
+
+# Evaluate Model performance
+# Confusion matrix
+confusionMatrix(boost_predict_test_df_5050, original_kaggle_total_data_test_50$ordered, positive = '1')
+```
+
+
+```{r}
+plot(varImp(original_kaggle_total_data_test_50))
+```
+
+
+```{r}
+%md
+Evaluation
+```
+
+
+```{r}
+# Define model list
+boosted_models_mapping <- list(
+  original_kaggle_total_data = c("boost_orig_8020", "boost_orig_7030", "boost_orig_6040", "boost_orig_5050"),
+  new_kaggle_total_data = c("boost_cat_8020", "boost_cat_7030", "boost_cat_6040", "boost_cat_5050"),
+  dropped_device_kaggle_total_data = c("boost_drop_8020", "boost_drop_7030", "boost_drop_6040", "boost_drop_5050")
+)
+```
+
+
+```{r}
+# Load dependencies
+library(caret)
+library(pROC)
+library(rpart.plot)
+library(gbm)
+
+evaluate_boosted_models <- function(model_mapping, target = "ordered") {
+  split_percents <- c("50", "60", "70", "80")
+
+  for (dataset_prefix in names(model_mapping)) {
+    models <- model_mapping[[dataset_prefix]]
+
+    for (model_method in models) {
+      for (split in split_percents) {
+        train_name <- paste0(dataset_prefix, "_train_", split)
+        test_name <- paste0(dataset_prefix, "_test_", as.character(100 - as.numeric(split)))
+        ctrl_name <- paste0(dataset_prefix, "_ctrl_", split)
+
+        train_df <- get(train_name)
+        test_df <- get(test_name)
+        tr_ctrl <- get(ctrl_name)
+
+        message("\n--- Evaluating ", model_method, " on ", train_name, " vs ", test_name, " ---")
+
+        # Fit model
+        model <- if (model_method == "glm") {
+          train(
+            as.formula(paste(target, "~ .")),
+            data = train_df,
+            method = "glm",
+            family = "binomial",
+            trControl = tr_ctrl
+          )
+        } else {
+          train(
+            as.formula(paste(target, "~ .")),
+            data = train_df,
+            method = model_method,
+            trControl = tr_ctrl
+          )
+        }
+
+        # Predictions
+        preds_class <- predict(model, newdata = test_df)
+        prob_col <- if ("class1" %in% colnames(predict(model, newdata = test_df, type = "prob"))) {
+          "class1"
+        } else {
+          colnames(predict(model, newdata = test_df, type = "prob"))[1]
+        }
+        preds_prob <- predict(model, newdata = test_df, type = "prob")[, prob_col]
+
+        # Confusion Matrix
+        cm <- confusionMatrix(preds_class, test_df[[target]])
+        print(cm)
+
+        # AUC and ROC
+        roc_obj <- roc(response = test_df[[target]], predictor = preds_prob)
+        auc_val <- auc(roc_obj)
+        print(paste("AUC:", round(auc_val, 4)))
+        plot(roc_obj, main = paste("ROC -", model_method, "-", train_name, "vs", test_name))
+
+        # Variable Importance
+        if ("varImp" %in% methods(class = class(model$finalModel))) {
+          vi <- varImp(model)
+          plot(vi, top = 10, main = paste("Top 10 Variable Importance -", model_method, "-", split))
+        } else {
+          message("Variable importance not supported for model: ", model_method)
+        }
+
+        # Tree visualization for boosting (gbm only here)
+        if (model_method == "gbm") {
+          message("Displaying a tree from gbm model")
+          pretty_tree <- summary(model$finalModel, plotit = FALSE)  # Triggers importance calc
+          print(head(pretty_tree))  # Optional
+          
+          # Plot the first tree in the model
+          gbm::plot.gbm(model$finalModel, i.var = 1, n.trees = model$finalModel$n.trees, main = paste("Partial Dependence -", model_method))
+          grid()
+        }
+
+        # Optionally: Save plots or output diagnostics to files here
+      }
+    }
+  }
+}
+
+```
+
+
+```{r}
+# Run evaluation with model list
+evaluate_boosted_models(boosted_models_mapping)
+```
